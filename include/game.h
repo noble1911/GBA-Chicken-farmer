@@ -4,7 +4,7 @@
 #include "gba.h"
 
 // Game constants
-#define MAX_CHICKENS 6
+#define MAX_CHICKENS 8
 #define MAX_FOOD 20
 #define MAX_EGGS 15
 #define MAX_CORPSES 10
@@ -45,6 +45,9 @@ typedef struct {
     u8 just_got_hungry;
     u8 happiness_timer;  // Timer for showing heart when eating favorite food
     ChickenGenes genes;
+    // Accumulators for time-scaled periodic effects
+    u16 hunger_tick_accum;     // accumulates toward hunger decrement period
+    u16 satiation_tick_accum;  // accumulates toward satiation decrement period
 } Chicken;
 
 // Food structure
@@ -76,5 +79,8 @@ void update_game();
 void draw_game();
 void spawn_chicken(s16 x, s16 y, ChickenGenes* parent_genes);
 void place_food(s16 x, s16 y, FoodType type);
+
+// Adjust global game speed (1 = normal). Higher values speed up timers (testing aid).
+void set_game_speed(u8 speed);
 
 #endif // GAME_H

@@ -20,6 +20,9 @@ int egg_count = 0;
 int corpse_count = 0;
 int generation_count = 1;
 u32 frames = 0;
+// Global speed multiplier (1 = normal). Increase to speed up timers for testing.
+static u8 game_speed = 3;
+void set_game_speed(u8 speed) { game_speed = speed ? speed : 1; }
 // Lower chicken update/draw load by updating chickens in stripes (buckets) each frame
 // 1 = update all every frame (full 60fps); 2 = ~30fps per chicken; 3 = ~20fps per chicken
 #ifndef CHICKEN_UPDATE_STRIDE
@@ -128,6 +131,8 @@ void init_game() {
     for (int i = 0; i < MAX_CHICKENS; i++) {
         chickens[i].active = 0;
         prev_chicken_active[i] = 0;
+        chickens[i].hunger_tick_accum = 0;
+        chickens[i].satiation_tick_accum = 0;
     }
     for (int i = 0; i < MAX_FOOD; i++) {
         foods[i].active = 0;
@@ -197,6 +202,8 @@ void spawn_chicken(s16 x, s16 y, ChickenGenes* parent_genes) {
             chickens[i].just_got_hungry = 0;
             chickens[i].happiness_timer = 0;
             chickens[i].genes = create_genes(parent_genes);
+            chickens[i].hunger_tick_accum = 0;
+            chickens[i].satiation_tick_accum = 0;
             chicken_count++;
             
             if (parent_genes != 0) {
@@ -210,28 +217,41 @@ void spawn_chicken(s16 x, s16 y, ChickenGenes* parent_genes) {
 void update_chicken(Chicken* c) {
     if (!c->active) return;
     
-    c->age++;
-    c->anim_counter++;
-    if (c->anim_counter > 15) {
-        c->anim_counter = 0;
+    // Time delta for this update (scaled)
+    int dt = game_speed;
+
+    // Age and animation advance with dt
+    c->age += dt;
+    c->anim_counter += dt;
+    while (c->anim_counter > 15) {
+        c->anim_counter -= 16;
         c->frame = (c->frame + 1) % 2;
     }
     
     // Update happiness timer
     if (c->happiness_timer > 0) {
-        c->happiness_timer--;
+        if (c->happiness_timer > dt) c->happiness_timer -= dt; else c->happiness_timer = 0;
     }
     
-    // Decrease hunger based on hunger_rate gene
-    if (frames % (12 - c->genes.hunger_rate / 2) == 0) {
-        if (c->hunger > 0) {
-            c->hunger--;
+    // Decrease hunger based on hunger_rate gene (scaled using accumulator)
+    {
+        u16 period = (u16)(12 - c->genes.hunger_rate / 2);
+        c->hunger_tick_accum += dt;
+        while (c->hunger_tick_accum >= period) {
+            if (c->hunger > 0) c->hunger--;
+            c->hunger_tick_accum -= period;
+            // Early out if already empty
+            if (c->hunger == 0) break;
         }
     }
     
-    // Decrease satiation
-    if (c->satiation > 0 && frames % 30 == 0) {
-        c->satiation--;
+    // Decrease satiation (scaled using accumulator)
+    if (c->satiation > 0) {
+        c->satiation_tick_accum += dt;
+        while (c->satiation_tick_accum >= 30 && c->satiation > 0) {
+            c->satiation--;
+            c->satiation_tick_accum -= 30;
+        }
     }
     
     // Check if chicken dies from hunger
@@ -258,7 +278,7 @@ void update_chicken(Chicken* c) {
     }
     
     if (c->egg_cooldown > 0) {
-        c->egg_cooldown--;
+        if (c->egg_cooldown > dt) c->egg_cooldown -= dt; else c->egg_cooldown = 0;
     }
     
     // Lay egg randomly when well-fed (higher chance than before)
@@ -467,7 +487,7 @@ void place_food(s16 x, s16 y, FoodType type) {
 void update_eggs() {
     for (int i = 0; i < MAX_EGGS; i++) {
         if (eggs[i].active) {
-            eggs[i].hatch_timer--;
+            if (eggs[i].hatch_timer > game_speed) eggs[i].hatch_timer -= game_speed; else eggs[i].hatch_timer = 0;
             
             if (eggs[i].hatch_timer == 0) {
                 // Hatch egg with sound
@@ -499,7 +519,7 @@ void create_corpse(s16 x, s16 y) {
 void update_corpses() {
     for (int i = 0; i < MAX_CORPSES; i++) {
         if (corpses[i].active) {
-            corpses[i].timer--;
+            if (corpses[i].timer > game_speed) corpses[i].timer -= game_speed; else corpses[i].timer = 0;
             
             if (corpses[i].timer == 0) {
                 corpses[i].active = 0;
