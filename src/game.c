@@ -20,6 +20,11 @@ int egg_count = 0;
 int corpse_count = 0;
 int generation_count = 1;
 u32 frames = 0;
+// Lower chicken update/draw load by updating chickens in stripes (buckets) each frame
+// 1 = update all every frame (full 60fps); 2 = ~30fps per chicken; 3 = ~20fps per chicken
+#ifndef CHICKEN_UPDATE_STRIDE
+#define CHICKEN_UPDATE_STRIDE 3
+#endif
 
 // Track chicken active state across frames to handle immediate cleanup on death
 static u8 prev_chicken_active[MAX_CHICKENS];
@@ -562,9 +567,13 @@ void update_game() {
         place_food(cursor_x, cursor_y, selected_food);
     }
     
-    // Update chickens
+    // Update chickens (bucketed by index to reduce per-frame work)
+    int bucket = frames % CHICKEN_UPDATE_STRIDE;
     for (int i = 0; i < MAX_CHICKENS; i++) {
-        update_chicken(&chickens[i]);
+        if (!chickens[i].active) continue;
+        if ((i % CHICKEN_UPDATE_STRIDE) == bucket) {
+            update_chicken(&chickens[i]);
+        }
     }
     
     // Update eggs
@@ -775,6 +784,8 @@ void draw_food(Food* f) {
             color = RGB(25, 10, 10);
             draw_rect(f->x, f->y, 5, 2, color);
             break;
+        default: // Includes FOOD_TYPE_COUNT or any invalid value
+            return;
     }
 }
 
@@ -890,6 +901,37 @@ void draw_all_chickens() {
         }
     }
 
+    // Aggressively merge overlapping/adjacent dirty rects until stable
+    if (dirty_count > 1) {
+        int merged;
+        do {
+            merged = 0;
+            for (int a = 0; a < dirty_count; a++) {
+                for (int b = a + 1; b < dirty_count; ) {
+                    s16 ax = dirty[a].x, ay = dirty[a].y, aw = dirty[a].w, ah = dirty[a].h;
+                    s16 bx = dirty[b].x, by = dirty[b].y, bw = dirty[b].w, bh = dirty[b].h;
+                    // Check intersection or adjacency (1px gap) to merge
+                    int overlap = (ax <= bx + bw + 1) && (bx <= ax + aw + 1) &&
+                                  (ay <= by + bh + 1) && (by <= ay + ah + 1);
+                    if (overlap) {
+                        s16 nx = (ax < bx) ? ax : bx;
+                        s16 ny = (ay < by) ? ay : by;
+                        s16 nx2 = ((ax + aw) > (bx + bw)) ? (ax + aw) : (bx + bw);
+                        s16 ny2 = ((ay + ah) > (by + bh)) ? (ay + ah) : (by + bh);
+                        dirty[a].x = nx; dirty[a].y = ny; dirty[a].w = nx2 - nx; dirty[a].h = ny2 - ny;
+                        // remove b by shifting tail
+                        for (int k = b; k < dirty_count - 1; k++) dirty[k] = dirty[k + 1];
+                        dirty_count--;
+                        merged = 1;
+                        // don't advance b; re-check current b index (now next element)
+                    } else {
+                        b++;
+                    }
+                }
+            }
+        } while (merged);
+    }
+
     // 2) Erase all dirty rects first
     for (int k = 0; k < dirty_count; k++) {
         draw_rect(dirty[k].x, dirty[k].y, dirty[k].w, dirty[k].h, bg_color);
@@ -929,11 +971,51 @@ void draw_all_chickens() {
         if (corpses[i].active) draw_corpse(&corpses[i]);
     }
 
-    // 5) Draw all chickens at their current positions (cheap and robust for MAX_CHICKENS=10)
+    // 5) Build y-sorted draw lists: moved/new first, then stationary but affected by dirties
+    typedef struct { int idx; s16 y; } DrawItem;
+    DrawItem moved_list[MAX_CHICKENS];
+    DrawItem stat_list[MAX_CHICKENS];
+    int moved_n = 0, stat_n = 0;
+
     for (int i = 0; i < MAX_CHICKENS; i++) {
-        if (chickens[i].active) {
-            draw_chicken(&chickens[i]);
+        if (!chickens[i].active) continue;
+        int is_new = (!prev_chicken_active[i] && chickens[i].active);
+        int moved = (chickens[i].x != chickens[i].prev_x || chickens[i].y != chickens[i].prev_y) || is_new;
+        if (moved) {
+            moved_list[moved_n++] = (DrawItem){ i, chickens[i].y };
+        } else if (dirty_count > 0) {
+            // stationary but check intersection with any dirty rect
+            s16 cx = chickens[i].x - 5;
+            s16 cy = chickens[i].y - 13;
+            s16 cw = 25;
+            s16 ch = 26;
+            int intersects = 0;
+            for (int k = 0; k < dirty_count; k++) {
+                s16 rx = dirty[k].x, ry = dirty[k].y, rw = dirty[k].w, rh = dirty[k].h;
+                if (cx < rx + rw && cx + cw > rx && cy < ry + rh && cy + ch > ry) { intersects = 1; break; }
+            }
+            if (intersects) stat_list[stat_n++] = (DrawItem){ i, chickens[i].y };
         }
+    }
+
+    // Simple insertion sort by y ascending (top to bottom)
+    for (int a = 1; a < moved_n; a++) {
+        DrawItem key = moved_list[a]; int b = a - 1;
+        while (b >= 0 && moved_list[b].y > key.y) { moved_list[b+1] = moved_list[b]; b--; }
+        moved_list[b+1] = key;
+    }
+    for (int a = 1; a < stat_n; a++) {
+        DrawItem key = stat_list[a]; int b = a - 1;
+        while (b >= 0 && stat_list[b].y > key.y) { stat_list[b+1] = stat_list[b]; b--; }
+        stat_list[b+1] = key;
+    }
+
+    // Draw moved/new first, then stationary affected, both y-sorted
+    for (int m = 0; m < moved_n; m++) {
+        draw_chicken(&chickens[moved_list[m].idx]);
+    }
+    for (int s = 0; s < stat_n; s++) {
+        draw_chicken(&chickens[stat_list[s].idx]);
     }
 
     // 6) Update previous positions and active flags AFTER drawing for next frame's cleanup detection

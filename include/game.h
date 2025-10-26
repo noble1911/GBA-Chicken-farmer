@@ -4,7 +4,7 @@
 #include "gba.h"
 
 // Game constants
-#define MAX_CHICKENS 10
+#define MAX_CHICKENS 6
 #define MAX_FOOD 20
 #define MAX_EGGS 15
 #define MAX_CORPSES 10
