@@ -21,6 +21,9 @@ int corpse_count = 0;
 int generation_count = 1;
 u32 frames = 0;
 
+// Track chicken active state across frames to handle immediate cleanup on death
+static u8 prev_chicken_active[MAX_CHICKENS];
+
 // Cursor
 s16 cursor_x = SCREEN_WIDTH / 2;
 s16 cursor_y = SCREEN_HEIGHT / 2;
@@ -119,6 +122,7 @@ void init_game() {
     // Clear everything
     for (int i = 0; i < MAX_CHICKENS; i++) {
         chickens[i].active = 0;
+        prev_chicken_active[i] = 0;
     }
     for (int i = 0; i < MAX_FOOD; i++) {
         foods[i].active = 0;
@@ -502,19 +506,32 @@ void update_corpses() {
 
 void draw_corpse(Corpse* c) {
     if (!c->active) return;
-    
-    // Draw a cooked chicken leg
-    // Drumstick part (brown)
-    draw_rect(c->x, c->y, 4, 8, RGB(20, 10, 5));
-    
-    // Bone sticking out (white)
-    draw_rect(c->x + 1, c->y + 8, 2, 3, RGB(31, 31, 25));
-    
-    // Darker shading on one side
-    draw_rect(c->x, c->y, 1, 8, RGB(15, 7, 3));
-    
-    // Highlight on other side
-    draw_rect(c->x + 3, c->y + 1, 1, 5, RGB(25, 15, 8));
+    // Draw simple crossed bones in white with slight gray shading
+    u16 bone_white = COLOR_WHITE;
+    u16 bone_shadow = COLOR_GRAY;
+    int x = c->x, y = c->y;
+    // First bone: bottom-left to top-right
+    draw_rect(x,     y + 3, 7, 2, bone_white);
+    draw_rect(x + 6, y + 2, 2, 4, bone_white);
+    draw_rect(x + 8, y + 1, 2, 6, bone_white);
+    draw_rect(x +10, y,     2, 8, bone_white);
+    // Round-ish ends
+    draw_rect(x -1,  y + 2, 2, 4, bone_white);
+    draw_rect(x +12, y -1,  3, 3, bone_white);
+    draw_rect(x +12, y +6,  3, 3, bone_white);
+    // Light shadow
+    draw_rect(x +10, y +7,  2, 1, bone_shadow);
+
+    // Second bone: top-left to bottom-right
+    draw_rect(x,     y + 4, 2, 2, bone_white);
+    draw_rect(x + 2, y + 3, 2, 4, bone_white);
+    draw_rect(x + 4, y + 2, 2, 6, bone_white);
+    draw_rect(x + 6, y + 1, 2, 8, bone_white);
+    draw_rect(x + 8, y,     2, 10, bone_white);
+    // Ends
+    draw_rect(x -1,  y + 3, 2, 4, bone_white);
+    draw_rect(x + 9, y -1,  3, 3, bone_white);
+    draw_rect(x + 9, y +8,  3, 3, bone_white);
 }
 
 void update_game() {
@@ -775,7 +792,17 @@ void draw_egg(Egg* e) {
 
 // Draw the UI bar at the top of the screen
 void draw_ui() {
-    // Always redraw UI so any cleanup overlapping top is restored immediately
+    // Redraw UI only when values change to reduce overdraw
+    static int prev_chicken_count = -1;
+    static int prev_generation_count = -1;
+    static FoodType prev_selected_food = (FoodType)-1;
+
+    if (chicken_count == prev_chicken_count &&
+        generation_count == prev_generation_count &&
+        selected_food == prev_selected_food) {
+        return; // No changes; skip drawing UI
+    }
+
     draw_rect(0, 0, SCREEN_WIDTH, 15, RGB(5, 10, 15));
     draw_string(5, 4, "CHICKENS:", COLOR_WHITE);
     draw_number(65, 4, chicken_count, COLOR_YELLOW);
@@ -784,6 +811,10 @@ void draw_ui() {
     draw_string(135, 4, food_names[selected_food], COLOR_ORANGE);
     draw_string(190, 4, "GEN:", COLOR_WHITE);
     draw_number(220, 4, generation_count, COLOR_GREEN);
+
+    prev_chicken_count = chicken_count;
+    prev_generation_count = generation_count;
+    prev_selected_food = selected_food;
 }
 
 // Draw all food items
@@ -816,8 +847,25 @@ void draw_all_chickens() {
     DirtyRect dirty[MAX_CHICKENS];
     int dirty_count = 0;
 
-    // 1) Collect dirty rects for all chickens that moved (based on previous position)
+    // 1) Collect dirty rects for all chickens that moved or just died (based on previous position)
     for (int i = 0; i < MAX_CHICKENS; i++) {
+        // If chicken was active last frame and now inactive, we need to erase its last drawn sprite area
+        if (prev_chicken_active[i] && !chickens[i].active) {
+            s16 x = chickens[i].prev_x - 5;
+            s16 y = chickens[i].prev_y - 13;
+            s16 w = 25;
+            s16 h = 26;
+            if (x < 0) { w += x; x = 0; }
+            if (y < 0) { h += y; y = 0; }
+            if (x + w > SCREEN_WIDTH)  w = SCREEN_WIDTH - x;
+            if (y + h > SCREEN_HEIGHT) h = SCREEN_HEIGHT - y;
+            if (y < 15) { s16 overlap = 15 - y; y = 15; h -= overlap; }
+            if (w > 0 && h > 0 && dirty_count < MAX_CHICKENS) {
+                dirty[dirty_count++] = (DirtyRect){ x, y, w, h };
+            }
+            continue;
+        }
+
         if (!chickens[i].active) continue;
         if (chickens[i].x == chickens[i].prev_x && chickens[i].y == chickens[i].prev_y) continue;
 
@@ -826,11 +874,16 @@ void draw_all_chickens() {
         s16 w = 25;
         s16 h = 26;
 
-        // Clip to screen bounds (do NOT clip against UI here; we'll redraw UI every frame)
+        // Clip to screen bounds; avoid touching UI (top 15px) since UI draws only on change
         if (x < 0) { w += x; x = 0; }
         if (y < 0) { h += y; y = 0; }
         if (x + w > SCREEN_WIDTH)  w = SCREEN_WIDTH - x;
         if (y + h > SCREEN_HEIGHT) h = SCREEN_HEIGHT - y;
+        if (y < 15) {
+            s16 overlap = 15 - y;
+            y = 15;
+            h -= overlap;
+        }
 
         if (w > 0 && h > 0 && dirty_count < MAX_CHICKENS) {
             dirty[dirty_count++] = (DirtyRect){ x, y, w, h };
@@ -842,7 +895,7 @@ void draw_all_chickens() {
         draw_rect(dirty[k].x, dirty[k].y, dirty[k].w, dirty[k].h, bg_color);
     }
 
-    // 3) Redraw static elements covered by any dirty rect
+    // 3) Redraw static elements covered by any dirty rect (food/eggs/corpses)
     for (int k = 0; k < dirty_count; k++) {
         s16 rx = dirty[k].x, ry = dirty[k].y, rw = dirty[k].w, rh = dirty[k].h;
         // Food
@@ -871,18 +924,25 @@ void draw_all_chickens() {
         }
     }
 
-    // 4) Update previous positions AFTER all cleanups are applied
-    for (int i = 0; i < MAX_CHICKENS; i++) {
-        if (!chickens[i].active) continue;
-        chickens[i].prev_x = chickens[i].x;
-        chickens[i].prev_y = chickens[i].y;
+    // 4) Draw all corpses so recent deaths appear immediately (below chickens)
+    for (int i = 0; i < MAX_CORPSES; i++) {
+        if (corpses[i].active) draw_corpse(&corpses[i]);
     }
 
-    // 5) Draw all chickens at their current positions (ensures none get erased later this frame)
+    // 5) Draw all chickens at their current positions (cheap and robust for MAX_CHICKENS=10)
     for (int i = 0; i < MAX_CHICKENS; i++) {
         if (chickens[i].active) {
             draw_chicken(&chickens[i]);
         }
+    }
+
+    // 6) Update previous positions and active flags AFTER drawing for next frame's cleanup detection
+    for (int i = 0; i < MAX_CHICKENS; i++) {
+        if (chickens[i].active) {
+            chickens[i].prev_x = chickens[i].x;
+            chickens[i].prev_y = chickens[i].y;
+        }
+        prev_chicken_active[i] = chickens[i].active;
     }
 }
 

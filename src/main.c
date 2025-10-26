@@ -10,9 +10,11 @@ int main() {
     init_game();
     
     while (1) {
-        vsync();
+        // Do updates during active period
         update_input();
         update_game();
+        // Wait until VBlank begins, then draw during VBlank
+        vsync();
         draw_game();
     }
     
