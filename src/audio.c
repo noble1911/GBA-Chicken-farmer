@@ -53,6 +53,17 @@ void play_eat_sound() {
     REG_SOUND2CNT_H = 0xC400;  // Low frequency
 }
 
+void play_eat_favorite_sound() {
+    // Favorite-eat: bright double chirp distinct from happy/lay
+    // Channel 1: short bright tone
+    REG_SOUND1CNT_L = 0x0074;  // Fast sweep up, small depth
+    REG_SOUND1CNT_H = 0xF10F;  // Duty 25%, medium volume, quick decay
+    REG_SOUND1CNT_X = 0xC6A0;  // Medium-high freq
+    // Channel 2: second, slightly higher follow-up
+    REG_SOUND2CNT_L = 0xF10E;  // Medium volume, quick decay
+    REG_SOUND2CNT_H = 0xC6C0;  // Slightly higher frequency
+}
+
 void play_happy_sound() {
     // Happy chirp: Quick ascending tone
     // Channel 1: Sweep up with bright sound
@@ -66,4 +77,11 @@ void play_hatch_sound() {
     // Channel 4: Noise channel for crack effect
     REG_SOUND4CNT_L = 0xF740;  // Medium volume, medium decay
     REG_SOUND4CNT_H = 0xC010;  // Short noise burst
+}
+
+void play_ambient_soft() {
+    // Subtle ambient: soft noise rustle using Channel 4 at low volume
+    // Low initial volume (0x3), longer decay to blur
+    REG_SOUND4CNT_L = 0x3720;  // Low volume, slow decay
+    REG_SOUND4CNT_H = 0xC03F;  // Continuous-ish short burst
 }

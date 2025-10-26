@@ -20,6 +20,8 @@ int egg_count = 0;
 int corpse_count = 0;
 int generation_count = 1;
 u32 frames = 0;
+// Request a full-screen redraw on next draw cycle (set when restarting)
+static u8 force_full_redraw = 0;
 // Global speed multiplier (1 = normal). Increase to speed up timers for testing.
 static u8 game_speed = 3;
 void set_game_speed(u8 speed) { game_speed = speed ? speed : 1; }
@@ -31,11 +33,19 @@ void set_game_speed(u8 speed) { game_speed = speed ? speed : 1; }
 
 // Track chicken active state across frames to handle immediate cleanup on death
 static u8 prev_chicken_active[MAX_CHICKENS];
+static u8 prev_corpse_active[MAX_CORPSES];
+// Track egg visibility changes for top-layer cleanup
+static u8 prev_egg_active[MAX_EGGS];
 
 // Cursor
 s16 cursor_x = SCREEN_WIDTH / 2;
 s16 cursor_y = SCREEN_HEIGHT / 2;
 FoodType selected_food = FOOD_SEEDS;
+// Simple sparkle FX for egg hatch (top layer)
+typedef struct { s16 x, y; u8 timer; u8 active; } FX;
+#define MAX_FX 12
+static FX fx[MAX_FX];
+static u8 prev_fx_active[MAX_FX];
 
 // Simple pseudo-random number generator
 u32 rand_seed = 12345;
@@ -123,6 +133,12 @@ ChickenGenes create_genes(ChickenGenes* parent) {
         genes.color = RGB(r, g, b);
     }
     
+    // Very rare special mutation: pink chicken
+    // ~0.4% chance (1 in 256) whenever a chicken is created (born)
+    if ((simple_rand() & 0xFF) == 0) {
+        genes.color = RGB(31, 12, 18); // bright pink
+    }
+    
     return genes;
 }
 
@@ -133,19 +149,28 @@ void init_game() {
         prev_chicken_active[i] = 0;
         chickens[i].hunger_tick_accum = 0;
         chickens[i].satiation_tick_accum = 0;
-        chickens[i].is_sitting = 0;
-        chickens[i].sit_timer = 0;
+            chickens[i].is_sitting = 0;
+            chickens[i].sit_timer = 0;
+            chickens[i].sit_phase = 0;
+        chickens[i].facing_left = 0;
         chickens[i].idle_timer = 0;
         chickens[i].move_timer = 0;
+            chickens[i].cluck_cooldown = 0;
     }
     for (int i = 0; i < MAX_FOOD; i++) {
         foods[i].active = 0;
     }
     for (int i = 0; i < MAX_EGGS; i++) {
         eggs[i].active = 0;
+        prev_egg_active[i] = 0;
     }
     for (int i = 0; i < MAX_CORPSES; i++) {
         corpses[i].active = 0;
+        prev_corpse_active[i] = 0;
+    }
+    for (int i = 0; i < MAX_FX; i++) {
+        fx[i].active = 0;
+        prev_fx_active[i] = 0;
     }
     
     chicken_count = 0;
@@ -194,6 +219,7 @@ void spawn_chicken(s16 x, s16 y, ChickenGenes* parent_genes) {
                     chickens[i].dx = 1;
                 }
             }
+            chickens[i].facing_left = (chickens[i].dx < 0);
             chickens[i].hunger = 350;  // Start hungrier so they seek food
             chickens[i].satiation = 200;
             chickens[i].age = i * 17;  // Different starting age for different behavior
@@ -210,8 +236,10 @@ void spawn_chicken(s16 x, s16 y, ChickenGenes* parent_genes) {
             chickens[i].satiation_tick_accum = 0;
             chickens[i].is_sitting = 0;
             chickens[i].sit_timer = 0;
+            chickens[i].sit_phase = 0;
             chickens[i].idle_timer = 0;
             chickens[i].move_timer = 0;
+            chickens[i].cluck_cooldown = 0;
             chicken_count++;
             
             if (parent_genes != 0) {
@@ -239,6 +267,10 @@ void update_chicken(Chicken* c) {
     // Update happiness timer
     if (c->happiness_timer > 0) {
         if (c->happiness_timer > dt) c->happiness_timer -= dt; else c->happiness_timer = 0;
+    }
+    // Update cluck cooldown (rate limit idle clucks)
+    if (c->cluck_cooldown > 0) {
+        if (c->cluck_cooldown > dt) c->cluck_cooldown -= dt; else c->cluck_cooldown = 0;
     }
     
     // Decrease hunger based on hunger_rate gene (scaled using accumulator)
@@ -296,6 +328,8 @@ void update_chicken(Chicken* c) {
         c->dx = 0; c->dy = 0;
         c->has_target = 0;
         c->can_lay_egg = 0; // consume the eligibility; cooldown after laying
+        // Audio cue for starting to sit
+        play_cluck_sound();
     }
 
     // Handle sitting state: wait, then lay egg
@@ -303,9 +337,15 @@ void update_chicken(Chicken* c) {
         if (c->sit_timer > dt) c->sit_timer -= dt; else c->sit_timer = 0;
         // Freeze movement while sitting
         c->dx = 0; c->dy = 0; c->has_target = 0;
-        if (c->sit_timer == 0) {
-            chicken_lay_egg(c);
-            c->is_sitting = 0;
+            if (c->sit_timer == 0) {
+                if (c->sit_phase == 0) {
+                    // Lay the egg, then remain seated a bit longer for visual clarity
+                    chicken_lay_egg(c);
+                    c->sit_phase = 1;
+                    c->sit_timer = 12; // ~0.2s settle before standing
+                } else {
+                    c->is_sitting = 0; // stand up after settle
+                }
         }
         // While sitting, skip AI and movement for this update
         return;
@@ -404,6 +444,11 @@ void update_chicken(Chicken* c) {
                 if (roll < idle_bias) {
                     c->idle_timer = 30 + (simple_rand() % 90); // 0.5s to 2s
                     c->dx = 0; c->dy = 0;
+                    // Intermittent cluck on entering idle, rate-limited
+                    if (c->cluck_cooldown == 0 && (simple_rand() % 100) < 25) {
+                        play_cluck_sound();
+                        c->cluck_cooldown = 120; // ~2 seconds
+                    }
                 } else {
                     c->move_timer = 30 + (simple_rand() % 60); // 0.5s to 1.5s
                     // Choose direction with light social bias if far from center
@@ -443,7 +488,10 @@ void update_chicken(Chicken* c) {
     if (c->dx < -1) c->dx = -1;
     if (c->dy > 1) c->dy = 1;
     if (c->dy < -1) c->dy = -1;
-    
+
+    // Update facing based on horizontal intention when not sitting
+    if (!c->is_sitting && c->dx != 0) c->facing_left = (c->dx < 0);
+
     // Move chicken
     c->x += c->dx;
     c->y += c->dy;
@@ -469,6 +517,30 @@ void update_chicken(Chicken* c) {
         c->dy = -c->dy;  // Reverse direction
         if (c->dy == 0) c->dy = -1;  // Make sure it moves
     }
+
+    // Gentle separation: small nudge away from nearest neighbor if too close
+    {
+        s32 best2 = 1 << 30;
+        s16 ndx = 0, ndy = 0; // vector from neighbor to this chicken
+        for (int j = 0; j < MAX_CHICKENS; j++) {
+            if (!chickens[j].active) continue;
+            if (&chickens[j] == c) continue;
+            s16 dxn = c->x - chickens[j].x;
+            s16 dyn = c->y - chickens[j].y;
+            s32 d2 = (s32)dxn * dxn + (s32)dyn * dyn;
+            if (d2 < best2) { best2 = d2; ndx = dxn; ndy = dyn; }
+        }
+        // Thresholds ~10px and ~7px radius
+        if (best2 < 100) {
+            if (ndx > 0) c->x++; else if (ndx < 0) c->x--;
+            if (best2 < 49) { if (ndy > 0) c->y++; else if (ndy < 0) c->y--; }
+            // Re-clamp to bounds after the nudge
+            if (c->x < 10) c->x = 10;
+            if (c->x > SCREEN_WIDTH - 25) c->x = SCREEN_WIDTH - 25;
+            if (c->y < 20) c->y = 20;
+            if (c->y > SCREEN_HEIGHT - 25) c->y = SCREEN_HEIGHT - 25;
+        }
+    }
     
     // Check if chicken can eat food
     for (int i = 0; i < MAX_FOOD; i++) {
@@ -489,8 +561,8 @@ void chicken_eat_food(Chicken* c, Food* f) {
     u8 is_favorite = (f->type == c->genes.food_preference);
     
     if (is_favorite) {
-        // Extra happy! Play special sound and show heart
-        play_happy_sound();
+        // Extra happy! Distinct favorite-eat sound and show heart
+        play_eat_favorite_sound();
         c->happiness_timer = 90;  // Show heart for 1.5 seconds
         
         // Bonus nutrition for favorite food (20% more effective)
@@ -529,7 +601,7 @@ void chicken_lay_egg(Chicken* c) {
         if (!eggs[i].active) {
             eggs[i].x = c->x;
             eggs[i].y = c->y + 10;
-            eggs[i].hatch_timer = 180; // 3 seconds at 60fps
+            eggs[i].hatch_timer = 360; // 3 seconds at 60fps
             eggs[i].active = 1;
             eggs[i].parent_genes = c->genes;
             egg_count++;
@@ -537,6 +609,8 @@ void chicken_lay_egg(Chicken* c) {
             c->can_lay_egg = 0;
             c->egg_cooldown = 300; // 5 second cooldown
             c->satiation -= 300;
+            // Audio cue for laying the egg
+            play_happy_sound();
             break;
         }
     }
@@ -570,12 +644,17 @@ void place_food(s16 x, s16 y, FoodType type) {
 void update_eggs() {
     for (int i = 0; i < MAX_EGGS; i++) {
         if (eggs[i].active) {
-            if (eggs[i].hatch_timer > game_speed) eggs[i].hatch_timer -= game_speed; else eggs[i].hatch_timer = 0;
+            // Hatch countdown runs in real frames (not scaled by game_speed)
+            if (eggs[i].hatch_timer > 0) eggs[i].hatch_timer--; else eggs[i].hatch_timer = 0;
             
             if (eggs[i].hatch_timer == 0) {
                 // Hatch egg with sound
                 play_hatch_sound();
                 spawn_chicken(eggs[i].x, eggs[i].y, &eggs[i].parent_genes);
+                // Sparkle effect at hatch location
+                for (int k = 0; k < MAX_FX; k++) {
+                    if (!fx[k].active) { fx[k].x = eggs[i].x; fx[k].y = eggs[i].y; fx[k].timer = 12; fx[k].active = 1; break; }
+                }
                 eggs[i].active = 0;
                 egg_count--;
             }
@@ -591,7 +670,7 @@ void create_corpse(s16 x, s16 y) {
         if (!corpses[i].active) {
             corpses[i].x = x;
             corpses[i].y = y;
-            corpses[i].timer = 180; // 3 seconds at 60fps
+            corpses[i].timer = 300; // 5 seconds at 60fps
             corpses[i].active = 1;
             corpse_count++;
             break;
@@ -602,7 +681,8 @@ void create_corpse(s16 x, s16 y) {
 void update_corpses() {
     for (int i = 0; i < MAX_CORPSES; i++) {
         if (corpses[i].active) {
-            if (corpses[i].timer > game_speed) corpses[i].timer -= game_speed; else corpses[i].timer = 0;
+            // Real-time countdown (not scaled)
+            if (corpses[i].timer > 0) corpses[i].timer--; else corpses[i].timer = 0;
             
             if (corpses[i].timer == 0) {
                 corpses[i].active = 0;
@@ -614,21 +694,43 @@ void update_corpses() {
 
 void draw_corpse(Corpse* c) {
     if (!c->active) return;
-    // Draw a simple white cross with slight gray shading
-    u16 col = COLOR_WHITE;
-    u16 shadow = COLOR_GRAY;
+    // Tombstone cross: thicker cross with small base and subtle shading
     int x = c->x, y = c->y;
-    // Vertical bar (2px wide, 12px tall)
-    draw_rect(x + 5, y - 6, 2, 12, col);
-    // Horizontal bar (12px wide, 2px tall)
-    draw_rect(x - 6, y - 0, 12, 2, col);
-    // Subtle shadow at lower-right
-    draw_rect(x + 7, y + 2, 1, 6, shadow);
-    draw_rect(x - 1, y + 2, 8, 1, shadow);
+    u16 stone = RGB(22,22,22);     // main stone color
+    u16 light = RGB(26,26,26);     // light edge
+    u16 dark  = RGB(12,12,12);     // dark edge
+
+    // Base pedestal
+    draw_rect(x + 3, y + 7, 10, 3, stone);
+    draw_rect(x + 3, y + 10, 10, 1, dark); // base shadow line
+
+    // Vertical stem (centered)
+    draw_rect(x + 5, y - 8, 4, 16, stone);
+    // Horizontal arms (centered slightly above middle)
+    draw_rect(x + 1, y - 2, 12, 3, stone);
+
+    // Top cap (slight taper)
+    draw_rect(x + 6, y - 10, 2, 2, stone);
+
+    // Light edge on top/left for bevel effect
+    draw_rect(x + 5, y - 8, 1, 16, light);   // left edge of stem
+    draw_rect(x + 1, y - 2, 12, 1, light);   // top of arms
+    draw_rect(x + 6, y - 10, 2, 1, light);   // top cap highlight
+
+    // Dark edge on bottom/right for depth
+    draw_rect(x + 8, y - 8, 1, 16, dark);    // right edge of stem
+    draw_rect(x + 1, y + 1, 12, 1, dark);    // bottom of arms
 }
 
 void update_game() {
     frames++;
+    // Subtle ambient loop: occasionally play a soft rustle
+    if ((frames % 240) == 0) {
+        // Every ~4 seconds; randomize a bit so it doesn't feel mechanical
+        if ((simple_rand() % 100) < 60) {
+            play_ambient_soft();
+        }
+    }
     
     // Update cursor
     if (key_is_down(KEY_UP)) cursor_y--;
@@ -669,6 +771,21 @@ void update_game() {
     
     // Update corpses
     update_corpses();
+    // Update FX timers (sparkles)
+    for (int i = 0; i < MAX_FX; i++) {
+        if (!fx[i].active) continue;
+        if (fx[i].timer > 0) fx[i].timer--; else fx[i].timer = 0;
+        if (fx[i].timer == 0) fx[i].active = 0;
+    }
+
+    // If all chickens are dead, allow restart via START button
+    if (chicken_count == 0) {
+        if (key_just_pressed(KEY_START)) {
+            init_game();
+            force_full_redraw = 1;
+            return;
+        }
+    }
 }
 
 void draw_chicken(Chicken* c) {
@@ -677,25 +794,41 @@ void draw_chicken(Chicken* c) {
     // Use the chicken's genetic color
     u16 body_color = c->genes.color;
     
-    // Determine if chicken is facing left (flip sprite)
-    u8 facing_left = (c->dx < 0);
+    // Use persistent facing so sitting/idle don't flip unexpectedly
+    u8 facing_left = c->facing_left;
+
+    // Subtle ground shadow under chicken for depth (drawn below the chicken)
+    {
+        u16 sh = RGB(8, 10, 8);
+        // Base shadow Y slightly below body; adapt a bit for age/sit
+        s16 sy = c->y + (c->is_sitting ? 9 : (c->age < 1800 ? 8 : 10));
+        s16 cx = c->x + 7; // center x of shadow
+        // 5-line oval: 6,10,12,10,6 px widths
+        draw_rect(cx - 3, sy + 0, 6, 1, sh);
+        draw_rect(cx - 5, sy + 1, 10, 1, sh);
+        draw_rect(cx - 6, sy + 2, 12, 1, sh);
+        draw_rect(cx - 5, sy + 3, 10, 1, sh);
+        draw_rect(cx - 3, sy + 4, 6, 1, sh);
+    }
 
     // Sitting pose (for pre-egg-lay state): squat body, head lower, no legs
     if (c->is_sitting) {
+        // Gentle bobbing while sitting (visual life): 0-1px vertical sway
+        s16 by = ((frames >> 3) & 1); // toggles every ~8 frames
+        s16 y0 = c->y + by;
         // Draw a simple rounded sitting shape regardless of age, with a beak and eye
         if (facing_left) {
-            draw_rect(c->x + 2, c->y + 2, 12, 6, body_color); // wider, lower body
-            draw_rect(c->x,     c->y,     6, 5, body_color);  // head on left
-            draw_rect(c->x - 2, c->y + 1, 2, 2, COLOR_ORANGE); // beak left
-            draw_pixel(c->x + 2, c->y + 1, COLOR_BLACK);      // eye
+            draw_rect(c->x + 2, y0 + 2, 12, 6, body_color); // wider, lower body
+            draw_rect(c->x,     y0,     6, 5, body_color);  // head on left
+            draw_rect(c->x - 2, y0 + 1, 2, 2, COLOR_ORANGE); // beak left
+            draw_pixel(c->x + 2, y0 + 1, COLOR_BLACK);      // eye
         } else {
-            draw_rect(c->x,     c->y + 2, 12, 6, body_color); // wider, lower body
-            draw_rect(c->x + 8, c->y,     6, 5, body_color);  // head on right
-            draw_rect(c->x + 14, c->y + 1, 2, 2, COLOR_ORANGE); // beak right
-            draw_pixel(c->x + 12, c->y + 1, COLOR_BLACK);     // eye
+            draw_rect(c->x,     y0 + 2, 12, 6, body_color); // wider, lower body
+            draw_rect(c->x + 8, y0,     6, 5, body_color);  // head on right
+            draw_rect(c->x + 14, y0 + 1, 2, 2, COLOR_ORANGE); // beak right
+            draw_pixel(c->x + 12, y0 + 1, COLOR_BLACK);     // eye
         }
-        // Optional subtle shadow under the body
-        draw_rect(c->x + 2, c->y + 8, 10, 1, RGB(10, 10, 10));
+        // Shadow handled globally above
 
         // Draw hunger bar and heart as usual below
     } else
@@ -880,9 +1013,9 @@ void draw_chicken_cleanup(s16 x, s16 y) {
     // Adult chicken is about 15 pixels wide (including beak), up to 13 pixels tall (including legs)
     // Hunger bar is at y-12, extends 20 pixels wide from x-5
     // Heart is at x+14, y-8
-    // Total area: x-5 to x+20 (25 wide), y-13 to y+13 (26 tall)
+    // Total area: x-5 to x+20 (25 wide), y-13 to y+15 (28 tall) — includes shadow under feet
     s16 cleanup_y = y - 13;
-    s16 cleanup_height = 26;
+    s16 cleanup_height = 28;
     s16 cleanup_x = x - 5;
     s16 cleanup_width = 25;
     
@@ -951,6 +1084,21 @@ void draw_ui() {
     draw_string(5, 4, "CHICKENS:", COLOR_WHITE);
     draw_number(65, 4, chicken_count, COLOR_YELLOW);
     draw_string(95, 4, "FOOD:", COLOR_WHITE);
+    // Tiny icon for selected food type next to label
+    switch (selected_food) {
+        case FOOD_SEEDS:
+            draw_rect(125, 6, 3, 3, COLOR_BROWN);
+            break;
+        case FOOD_CORN:
+            draw_rect(124, 4, 4, 5, COLOR_YELLOW);
+            draw_rect(125, 3, 2, 2, COLOR_GREEN);
+            break;
+        case FOOD_WORMS:
+            draw_rect(123, 6, 5, 2, RGB(25, 10, 10));
+            break;
+        default:
+            break;
+    }
     const char* food_names[] = {"SEEDS", "CORN", "WORMS"};
     draw_string(135, 4, food_names[selected_food], COLOR_ORANGE);
     draw_string(190, 4, "GEN:", COLOR_WHITE);
@@ -963,15 +1111,32 @@ void draw_ui() {
 
 // Draw all food items
 void draw_all_food() {
+    // Clean up graves that disappeared since last frame (bottom layer cleanup)
+    u16 bg = RGB(15, 25, 15);
+    for (int i = 0; i < MAX_CORPSES; i++) {
+        if (prev_corpse_active[i] && !corpses[i].active) {
+            s16 rx = corpses[i].x - 2;
+            s16 ry = corpses[i].y - 12;
+            s16 rw = 20;
+            s16 rh = 30;
+            if (rx < 0) { rw += rx; rx = 0; }
+            if (ry < 15) { rh -= (15 - ry); ry = 15; }
+            if (rx + rw > SCREEN_WIDTH)  rw = SCREEN_WIDTH - rx;
+            if (ry + rh > SCREEN_HEIGHT) rh = SCREEN_HEIGHT - ry;
+            if (rw > 0 && rh > 0) draw_rect(rx, ry, rw, rh, bg);
+            // Redraw any food covered by the cleanup
+            for (int f = 0; f < MAX_FOOD; f++) {
+                if (!foods[f].active) continue;
+                if (foods[f].x >= rx - 5 && foods[f].x <= rx + rw + 5 &&
+                    foods[f].y >= ry - 5 && foods[f].y <= ry + rh + 5) {
+                    draw_food(&foods[f]);
+                }
+            }
+        }
+    }
     for (int i = 0; i < MAX_FOOD; i++) {
         if (foods[i].active) {
             draw_food(&foods[i]);
-        }
-    }
-    
-    for (int i = 0; i < MAX_EGGS; i++) {
-        if (eggs[i].active) {
-            draw_egg(&eggs[i]);
         }
     }
     
@@ -980,6 +1145,121 @@ void draw_all_food() {
             draw_corpse(&corpses[i]);
         }
     }
+    for (int i = 0; i < MAX_CORPSES; i++) prev_corpse_active[i] = corpses[i].active;
+}
+
+// Draw corpses on the bottom layer every frame and handle disappearance cleanup
+static void draw_all_corpses_bottom() {
+    u16 bg = RGB(15, 25, 15);
+    // Cleanup any that disappeared
+    for (int i = 0; i < MAX_CORPSES; i++) {
+        if (prev_corpse_active[i] && !corpses[i].active) {
+            s16 rx = corpses[i].x - 2;
+            s16 ry = corpses[i].y - 12;
+            s16 rw = 20;
+            s16 rh = 30;
+            if (rx < 0) { rw += rx; rx = 0; }
+            if (ry < 15) { rh -= (15 - ry); ry = 15; }
+            if (rx + rw > SCREEN_WIDTH)  rw = SCREEN_WIDTH - rx;
+            if (ry + rh > SCREEN_HEIGHT) rh = SCREEN_HEIGHT - ry;
+            if (rw > 0 && rh > 0) draw_rect(rx, ry, rw, rh, bg);
+            // Redraw food under cleaned area
+            for (int f = 0; f < MAX_FOOD; f++) {
+                if (!foods[f].active) continue;
+                if (foods[f].x >= rx - 5 && foods[f].x <= rx + rw + 5 &&
+                    foods[f].y >= ry - 5 && foods[f].y <= ry + rh + 5) {
+                    draw_food(&foods[f]);
+                }
+            }
+        }
+    }
+    // Draw active corpses on bottom layer
+    for (int i = 0; i < MAX_CORPSES; i++) {
+        if (corpses[i].active) draw_corpse(&corpses[i]);
+    }
+    // Update prev flags
+    for (int i = 0; i < MAX_CORPSES; i++) prev_corpse_active[i] = corpses[i].active;
+}
+
+// Draw eggs as a top layer (above chickens). Also handles cleanup when eggs disappear.
+void draw_all_eggs() {
+    u16 bg_color = RGB(15, 25, 15);
+    // Clean up eggs that were visible last frame but now inactive
+    for (int i = 0; i < MAX_EGGS; i++) {
+        if (prev_egg_active[i] && !eggs[i].active) {
+            // Erase an area around the egg footprint (safe margin)
+            s16 x = eggs[i].x - 2;
+            s16 y = eggs[i].y - 2;
+            s16 w = 9;
+            s16 h = 10;
+            if (x < 0) { w += x; x = 0; }
+            if (y < 15) { h -= (15 - y); y = 15; } // avoid UI band
+            if (x + w > SCREEN_WIDTH)  w = SCREEN_WIDTH - x;
+            if (y + h > SCREEN_HEIGHT) h = SCREEN_HEIGHT - y;
+            if (w > 0 && h > 0) draw_rect(x, y, w, h, bg_color);
+        }
+    }
+    // Draw all active eggs on top
+    for (int i = 0; i < MAX_EGGS; i++) {
+        if (eggs[i].active) {
+            draw_egg(&eggs[i]);
+        }
+    }
+    // Update previous active flags
+    for (int i = 0; i < MAX_EGGS; i++) prev_egg_active[i] = eggs[i].active;
+}
+
+// Draw sparkle FX on a top layer (above chickens and eggs). Performs self-cleanup each frame.
+static void draw_fx_shape(int x, int y, u8 phase) {
+    // phase cycles 0..2 for a simple sparkle animation
+    u16 c1 = COLOR_YELLOW;
+    u16 c2 = COLOR_WHITE;
+    switch (phase) {
+        case 0:
+            // small plus
+            draw_pixel(x, y-2, c1); draw_pixel(x, y+2, c1);
+            draw_pixel(x-2, y, c1); draw_pixel(x+2, y, c1);
+            draw_pixel(x, y, c2);
+            break;
+        case 1:
+            // small X
+            draw_pixel(x-1, y-1, c1); draw_pixel(x+1, y-1, c1);
+            draw_pixel(x-1, y+1, c1); draw_pixel(x+1, y+1, c1);
+            draw_pixel(x, y, c2);
+            break;
+        default:
+            // bigger star
+            draw_pixel(x, y-3, c1); draw_pixel(x, y+3, c1);
+            draw_pixel(x-3, y, c1); draw_pixel(x+3, y, c1);
+            draw_pixel(x-2, y-2, c1); draw_pixel(x+2, y-2, c1);
+            draw_pixel(x-2, y+2, c1); draw_pixel(x+2, y+2, c1);
+            draw_pixel(x, y, c2);
+            break;
+    }
+}
+
+void draw_all_fx() {
+    u16 bg = RGB(15, 25, 15);
+    // Clear previous footprints for all slots that were active last frame
+    for (int i = 0; i < MAX_FX; i++) {
+        if (!prev_fx_active[i]) continue;
+        s16 x = fx[i].x - 4;
+        s16 y = fx[i].y - 4;
+        s16 w = 9, h = 9;
+        if (x < 0) { w += x; x = 0; }
+        if (y < 15) { h -= (15 - y); y = 15; }
+        if (x + w > SCREEN_WIDTH)  w = SCREEN_WIDTH - x;
+        if (y + h > SCREEN_HEIGHT) h = SCREEN_HEIGHT - y;
+        if (w > 0 && h > 0) draw_rect(x, y, w, h, bg);
+    }
+    // Draw current FX
+    for (int i = 0; i < MAX_FX; i++) {
+        if (!fx[i].active) continue;
+        u8 phase = (fx[i].timer / 4) % 3; // 0..2
+        draw_fx_shape(fx[i].x, fx[i].y, phase);
+    }
+    // Update prev flags
+    for (int i = 0; i < MAX_FX; i++) prev_fx_active[i] = fx[i].active;
 }
 
 // Draw all chickens with batched cleanup to avoid mid-frame erasure
@@ -988,7 +1268,7 @@ void draw_all_chickens() {
 
     // Local rect type
     typedef struct { s16 x, y, w, h; } DirtyRect;
-    DirtyRect dirty[MAX_CHICKENS];
+    DirtyRect dirty[MAX_CHICKENS * 2];
     int dirty_count = 0;
 
     // 1) Collect dirty rects for all chickens that moved or just died (based on previous position)
@@ -998,7 +1278,7 @@ void draw_all_chickens() {
             s16 x = chickens[i].prev_x - 5;
             s16 y = chickens[i].prev_y - 13;
             s16 w = 25;
-            s16 h = 26;
+            s16 h = 28; // include shadow footprint (extends slightly below feet)
             if (x < 0) { w += x; x = 0; }
             if (y < 0) { h += y; y = 0; }
             if (x + w > SCREEN_WIDTH)  w = SCREEN_WIDTH - x;
@@ -1013,10 +1293,10 @@ void draw_all_chickens() {
         if (!chickens[i].active) continue;
         if (chickens[i].x == chickens[i].prev_x && chickens[i].y == chickens[i].prev_y) continue;
 
-        s16 x = chickens[i].prev_x - 5;
-        s16 y = chickens[i].prev_y - 13;
-        s16 w = 25;
-        s16 h = 26;
+    s16 x = chickens[i].prev_x - 5;
+    s16 y = chickens[i].prev_y - 13;
+    s16 w = 25;
+    s16 h = 28; // include shadow footprint
 
         // Clip to screen bounds; avoid touching UI (top 15px) since UI draws only on change
         if (x < 0) { w += x; x = 0; }
@@ -1065,6 +1345,62 @@ void draw_all_chickens() {
         } while (merged);
     }
 
+    // Ensure stationary chickens that intersect any dirty area get fully cleaned before redraw.
+    // Append their full bounding boxes to dirty list, then re-merge.
+    if (dirty_count > 0) {
+        for (int i = 0; i < MAX_CHICKENS && dirty_count < (MAX_CHICKENS * 2); i++) {
+            if (!chickens[i].active) continue;
+            if (chickens[i].x != chickens[i].prev_x || chickens[i].y != chickens[i].prev_y) continue; // moved ones already handled via their prev rect
+            // Current bounding box
+            s16 cx = chickens[i].x - 5;
+            s16 cy = chickens[i].y - 13;
+            s16 cw = 25;
+            s16 ch = 28;
+            // Clip to screen/UI bounds
+            if (cx < 0) { cw += cx; cx = 0; }
+            if (cy < 0) { ch += cy; cy = 0; }
+            if (cx + cw > SCREEN_WIDTH)  cw = SCREEN_WIDTH - cx;
+            if (cy + ch > SCREEN_HEIGHT) ch = SCREEN_HEIGHT - cy;
+            if (cy < 15) { s16 overlap = 15 - cy; cy = 15; ch -= overlap; }
+            if (cw <= 0 || ch <= 0) continue;
+            int intersects = 0;
+            for (int k = 0; k < dirty_count; k++) {
+                s16 rx = dirty[k].x, ry = dirty[k].y, rw = dirty[k].w, rh = dirty[k].h;
+                if (cx < rx + rw && cx + cw > rx && cy < ry + rh && cy + ch > ry) { intersects = 1; break; }
+            }
+            if (intersects) {
+                dirty[dirty_count++] = (DirtyRect){ cx, cy, cw, ch };
+            }
+        }
+        // Re-merge after adding stationary bounding boxes
+        if (dirty_count > 1) {
+            int merged;
+            do {
+                merged = 0;
+                for (int a = 0; a < dirty_count; a++) {
+                    for (int b = a + 1; b < dirty_count; ) {
+                        s16 ax = dirty[a].x, ay = dirty[a].y, aw = dirty[a].w, ah = dirty[a].h;
+                        s16 bx = dirty[b].x, by = dirty[b].y, bw = dirty[b].w, bh = dirty[b].h;
+                        int overlap = (ax <= bx + bw + 1) && (bx <= ax + aw + 1) &&
+                                      (ay <= by + bh + 1) && (by <= ay + ah + 1);
+                        if (overlap) {
+                            s16 nx = (ax < bx) ? ax : bx;
+                            s16 ny = (ay < by) ? ay : by;
+                            s16 nx2 = ((ax + aw) > (bx + bw)) ? (ax + aw) : (bx + bw);
+                            s16 ny2 = ((ay + ah) > (by + bh)) ? (ay + ah) : (by + bh);
+                            dirty[a].x = nx; dirty[a].y = ny; dirty[a].w = nx2 - nx; dirty[a].h = ny2 - ny;
+                            for (int k = b; k < dirty_count - 1; k++) dirty[k] = dirty[k + 1];
+                            dirty_count--;
+                            merged = 1;
+                        } else {
+                            b++;
+                        }
+                    }
+                }
+            } while (merged);
+        }
+    }
+
     // 2) Erase all dirty rects first
     for (int k = 0; k < dirty_count; k++) {
         draw_rect(dirty[k].x, dirty[k].y, dirty[k].w, dirty[k].h, bg_color);
@@ -1081,14 +1417,7 @@ void draw_all_chickens() {
                 draw_food(&foods[j]);
             }
         }
-        // Eggs
-        for (int j = 0; j < MAX_EGGS; j++) {
-            if (!eggs[j].active) continue;
-            if (eggs[j].x >= rx - 5 && eggs[j].x <= rx + rw + 5 &&
-                eggs[j].y >= ry - 5 && eggs[j].y <= ry + rh + 5) {
-                draw_egg(&eggs[j]);
-            }
-        }
+        // Eggs are drawn as a top layer; no redraw here
         // Corpses
         for (int j = 0; j < MAX_CORPSES; j++) {
             if (!corpses[j].active) continue;
@@ -1099,12 +1428,7 @@ void draw_all_chickens() {
         }
     }
 
-    // 4) Draw all corpses so recent deaths appear immediately (below chickens)
-    for (int i = 0; i < MAX_CORPSES; i++) {
-        if (corpses[i].active) draw_corpse(&corpses[i]);
-    }
-
-    // 5) Build y-sorted draw lists: moved/new first, then stationary but affected by dirties
+    // 4) Build y-sorted draw lists: moved/new first, then stationary but affected by dirties
     typedef struct { int idx; s16 y; } DrawItem;
     DrawItem moved_list[MAX_CHICKENS];
     DrawItem stat_list[MAX_CHICKENS];
@@ -1121,7 +1445,7 @@ void draw_all_chickens() {
             s16 cx = chickens[i].x - 5;
             s16 cy = chickens[i].y - 13;
             s16 cw = 25;
-            s16 ch = 26;
+            s16 ch = 28; // include shadow footprint
             int intersects = 0;
             for (int k = 0; k < dirty_count; k++) {
                 s16 rx = dirty[k].x, ry = dirty[k].y, rw = dirty[k].w, rh = dirty[k].h;
@@ -1151,7 +1475,7 @@ void draw_all_chickens() {
         draw_chicken(&chickens[stat_list[s].idx]);
     }
 
-    // 6) Update previous positions and active flags AFTER drawing for next frame's cleanup detection
+    // 5) Update previous positions and active flags AFTER drawing for next frame's cleanup detection
     for (int i = 0; i < MAX_CHICKENS; i++) {
         if (chickens[i].active) {
             chickens[i].prev_x = chickens[i].x;
@@ -1170,8 +1494,8 @@ void draw_cursor() {
     // Clean up old cursor position if it moved
     if (cursor_x != prev_cursor_x || cursor_y != prev_cursor_y) {
         // Only erase old cursor if it was in game area (not overlapping UI)
-        if (prev_cursor_y >= 18) {  // cursor is 5px tall, center at y, so y-2 should be > 15
-            draw_rect(prev_cursor_x - 3, prev_cursor_y - 3, 7, 7, bg_color);
+        if (prev_cursor_y >= 18) {  // cursor is ~5px; erase a larger area to cover ring
+            draw_rect(prev_cursor_x - 5, prev_cursor_y - 5, 11, 11, bg_color);
             
             // Redraw anything under old cursor position
             for (int i = 0; i < MAX_FOOD; i++) {
@@ -1198,6 +1522,13 @@ void draw_cursor() {
                     draw_chicken(&chickens[i]);
                 }
             }
+            for (int i = 0; i < MAX_FX; i++) {
+                if (fx[i].active && fx[i].x >= prev_cursor_x - 8 && fx[i].x <= prev_cursor_x + 8 &&
+                    fx[i].y >= prev_cursor_y - 8 && fx[i].y <= prev_cursor_y + 8) {
+                    u8 phase = (fx[i].timer / 4) % 3;
+                    draw_fx_shape(fx[i].x, fx[i].y, phase);
+                }
+            }
         }
         
         // Update previous cursor position
@@ -1206,24 +1537,41 @@ void draw_cursor() {
     }
     
     // ALWAYS draw cursor at current position (even if it didn't move)
-    // This ensures cursor stays on top even if chickens moved underneath it
+    // Crosshair
     draw_rect(cursor_x - 2, cursor_y - 2, 5, 1, COLOR_WHITE);
     draw_rect(cursor_x - 2, cursor_y + 2, 5, 1, COLOR_WHITE);
     draw_rect(cursor_x - 2, cursor_y - 2, 1, 5, COLOR_WHITE);
     draw_rect(cursor_x + 2, cursor_y - 2, 1, 5, COLOR_WHITE);
+    // Faint diamond ring around the crosshair
+    u16 ring = COLOR_GRAY;
+    draw_pixel(cursor_x, cursor_y - 3, ring);
+    draw_pixel(cursor_x, cursor_y + 3, ring);
+    draw_pixel(cursor_x - 3, cursor_y, ring);
+    draw_pixel(cursor_x + 3, cursor_y, ring);
+    draw_pixel(cursor_x - 2, cursor_y - 1, ring);
+    draw_pixel(cursor_x + 2, cursor_y - 1, ring);
+    draw_pixel(cursor_x - 2, cursor_y + 1, ring);
+    draw_pixel(cursor_x + 2, cursor_y + 1, ring);
+    draw_pixel(cursor_x - 1, cursor_y - 2, ring);
+    draw_pixel(cursor_x + 1, cursor_y - 2, ring);
+    draw_pixel(cursor_x - 1, cursor_y + 2, ring);
+    draw_pixel(cursor_x + 1, cursor_y + 2, ring);
 }
 
 void draw_game() {
     static u8 first_draw = 1;
     
-    // On first draw, clear entire screen
-    if (first_draw) {
+    // On first draw, or when forced, clear and redraw everything
+    if (first_draw || force_full_redraw) {
         fill_screen(RGB(15, 25, 15));
         first_draw = 0;
+        force_full_redraw = 0;
         
         // Draw all static elements on first frame
-        draw_all_food();
-        draw_all_chickens();
+        draw_all_food();      // food + corpses
+        draw_all_chickens();  // chickens (middle)
+        draw_all_eggs();      // eggs above chickens
+        draw_all_fx();        // sparkles above eggs
         draw_cursor();
         draw_ui();
         return;
@@ -1238,8 +1586,24 @@ void draw_game() {
     // Note: Food layer is not explicitly redrawn here because it's static.
     // It only gets redrawn when chickens or cursor pass over it (in their cleanup routines)
     
+    draw_all_corpses_bottom(); // keep graves behind chickens and handle removals
     draw_all_chickens();  // Handles cleanup and selective redraw
+    draw_all_eggs();      // Eggs above chickens
+    draw_all_fx();        // FX on top
     draw_cursor();        // Draw cursor last so it stays on top
     draw_ui();            // Always redraw UI; ensures top bar is restored if any cleanup hit it
+
+    // Overlay restart prompt when no chickens remain
+    if (chicken_count == 0) {
+        const char* msg = "Press START to Restart";
+        // Compute approximate centered X based on 6px per glyph spacing
+        int len = 0; while (msg[len] != '\0') len++;
+        int w = len * 6;
+        int x = (SCREEN_WIDTH - w) / 2;
+        if (x < 0) x = 0;
+        int y = (SCREEN_HEIGHT / 2);
+        if (y < 20) y = 20; // keep below UI
+        draw_string(x, y, msg, COLOR_WHITE);
+    }
 }
 

@@ -32,6 +32,7 @@ typedef struct {
     s16 x, y;
     s16 prev_x, prev_y;
     s8 dx, dy;  // MUST be signed char (s8) for proper movement in all directions
+    u8 facing_left;   // persistent facing used for drawing when dx==0 or sitting
     u16 hunger;
     u16 satiation;
     u16 age;
@@ -51,9 +52,11 @@ typedef struct {
     // Egg-laying pre-sit state
     u8 is_sitting;      // 1 when preparing to lay egg (shows sitting sprite)
     u16 sit_timer;      // counts down (~5s) before egg appears
+    u8 sit_phase;       // 0 = waiting to lay, 1 = post-lay settle before standing
     // Natural movement timing
     u16 idle_timer;     // when >0, chicken rests (dx=dy=0)
     u16 move_timer;     // duration to keep current direction before reevaluating
+    u16 cluck_cooldown; // rate limit for idle-transition clucks
 } Chicken;
 
 // Food structure
