@@ -133,6 +133,10 @@ void init_game() {
         prev_chicken_active[i] = 0;
         chickens[i].hunger_tick_accum = 0;
         chickens[i].satiation_tick_accum = 0;
+        chickens[i].is_sitting = 0;
+        chickens[i].sit_timer = 0;
+        chickens[i].idle_timer = 0;
+        chickens[i].move_timer = 0;
     }
     for (int i = 0; i < MAX_FOOD; i++) {
         foods[i].active = 0;
@@ -204,6 +208,10 @@ void spawn_chicken(s16 x, s16 y, ChickenGenes* parent_genes) {
             chickens[i].genes = create_genes(parent_genes);
             chickens[i].hunger_tick_accum = 0;
             chickens[i].satiation_tick_accum = 0;
+            chickens[i].is_sitting = 0;
+            chickens[i].sit_timer = 0;
+            chickens[i].idle_timer = 0;
+            chickens[i].move_timer = 0;
             chicken_count++;
             
             if (parent_genes != 0) {
@@ -281,9 +289,26 @@ void update_chicken(Chicken* c) {
         if (c->egg_cooldown > dt) c->egg_cooldown -= dt; else c->egg_cooldown = 0;
     }
     
-    // Lay egg randomly when well-fed (higher chance than before)
-    if (c->can_lay_egg && (simple_rand() % (50 + (10 - c->genes.fertility) * 5)) < 2) {
-        chicken_lay_egg(c);
+    // Start sitting (pre-lay) randomly when well-fed and eligible
+    if (!c->is_sitting && c->can_lay_egg && (simple_rand() % (50 + (10 - c->genes.fertility) * 5)) < 2) {
+        c->is_sitting = 1;
+        c->sit_timer = 300; // 5 seconds at 60fps
+        c->dx = 0; c->dy = 0;
+        c->has_target = 0;
+        c->can_lay_egg = 0; // consume the eligibility; cooldown after laying
+    }
+
+    // Handle sitting state: wait, then lay egg
+    if (c->is_sitting) {
+        if (c->sit_timer > dt) c->sit_timer -= dt; else c->sit_timer = 0;
+        // Freeze movement while sitting
+        c->dx = 0; c->dy = 0; c->has_target = 0;
+        if (c->sit_timer == 0) {
+            chicken_lay_egg(c);
+            c->is_sitting = 0;
+        }
+        // While sitting, skip AI and movement for this update
+        return;
     }
     
     // AI: Find food when hungry
@@ -343,14 +368,72 @@ void update_chicken(Chicken* c) {
             else c->dy = 0;
         }
     } else {
-        // Wander randomly - use chicken's age for unique timing
-        // This runs when: not seeking food, OR seeking but no food available
-        if ((frames + c->age) % 30 == 0) {  // More frequent - every 0.5 seconds
-            c->dx = (simple_rand() % 3) - 1;
-            c->dy = (simple_rand() % 3) - 1;
-            // Don't let both be zero
-            if (c->dx == 0 && c->dy == 0) {
-                c->dx = (simple_rand() % 2) ? 1 : -1;
+        // Social center (cohesion) among other active chickens
+        int sumx = 0, sumy = 0, count = 0;
+        for (int j = 0; j < MAX_CHICKENS; j++) {
+            if (!chickens[j].active) continue;
+            if (&chickens[j] == c) continue;
+            sumx += chickens[j].x;
+            sumy += chickens[j].y;
+            count++;
+        }
+        s16 cx = c->x, cy = c->y;
+        if (count > 0) { cx = sumx / count; cy = sumy / count; }
+
+        // Preferred distance to flock center
+        const s16 preferred = 35;
+        s16 ddx = 0, ddy = 0;
+        if (count > 0) {
+            s16 vx = cx - c->x; if (vx > 0) ddx = 1; else if (vx < 0) ddx = -1; else ddx = 0;
+            s16 vy = cy - c->y; if (vy > 0) ddy = 1; else if (vy < 0) ddy = -1; else ddy = 0;
+        }
+        // Distance squared to center
+        s32 dist2 = (s32)(cx - c->x) * (cx - c->x) + (s32)(cy - c->y) * (cy - c->y);
+        s32 pref2 = (s32)preferred * preferred;
+
+        // Idle and move timers control natural bouts
+        if (c->idle_timer > 0) {
+            c->idle_timer = (c->idle_timer > dt) ? (c->idle_timer - dt) : 0;
+            c->dx = 0; c->dy = 0;
+        } else {
+            if (c->move_timer == 0) {
+                // Decide to idle or move next
+                int idle_bias = 45; // base 45% idle
+                if (count > 0 && dist2 < pref2) idle_bias = 65; // more likely to rest when near family
+                int roll = simple_rand() % 100;
+                if (roll < idle_bias) {
+                    c->idle_timer = 30 + (simple_rand() % 90); // 0.5s to 2s
+                    c->dx = 0; c->dy = 0;
+                } else {
+                    c->move_timer = 30 + (simple_rand() % 60); // 0.5s to 1.5s
+                    // Choose direction with light social bias if far from center
+                    if (count > 0 && dist2 > pref2) {
+                        // 70% follow bias, else random jitter
+                        if ((simple_rand() % 100) < 70) {
+                            c->dx = ddx;
+                            c->dy = ddy;
+                        } else {
+                            c->dx = (simple_rand() % 3) - 1;
+                            c->dy = (simple_rand() % 3) - 1;
+                        }
+                    } else {
+                        // Near center: mild random walk
+                        c->dx = (simple_rand() % 3) - 1;
+                        c->dy = (simple_rand() % 3) - 1;
+                    }
+                    if (c->dx == 0 && c->dy == 0) c->dx = (simple_rand() % 2) ? 1 : -1;
+                }
+            } else {
+                // Continue moving, occasionally jitter and nudge toward center if far
+                c->move_timer = (c->move_timer > dt) ? (c->move_timer - dt) : 0;
+                if ((simple_rand() % 20) == 0) {
+                    // small jitter on one axis
+                    if (simple_rand() & 1) c->dx = (simple_rand() % 3) - 1; else c->dy = (simple_rand() % 3) - 1;
+                    if (c->dx == 0 && c->dy == 0) c->dx = 1;
+                }
+                if (count > 0 && dist2 > (pref2 + 400)) { // if pretty far, nudge toward center
+                    if ((simple_rand() % 3) == 0) { c->dx = ddx; c->dy = ddy; }
+                }
             }
         }
     }
@@ -531,32 +614,17 @@ void update_corpses() {
 
 void draw_corpse(Corpse* c) {
     if (!c->active) return;
-    // Draw simple crossed bones in white with slight gray shading
-    u16 bone_white = COLOR_WHITE;
-    u16 bone_shadow = COLOR_GRAY;
+    // Draw a simple white cross with slight gray shading
+    u16 col = COLOR_WHITE;
+    u16 shadow = COLOR_GRAY;
     int x = c->x, y = c->y;
-    // First bone: bottom-left to top-right
-    draw_rect(x,     y + 3, 7, 2, bone_white);
-    draw_rect(x + 6, y + 2, 2, 4, bone_white);
-    draw_rect(x + 8, y + 1, 2, 6, bone_white);
-    draw_rect(x +10, y,     2, 8, bone_white);
-    // Round-ish ends
-    draw_rect(x -1,  y + 2, 2, 4, bone_white);
-    draw_rect(x +12, y -1,  3, 3, bone_white);
-    draw_rect(x +12, y +6,  3, 3, bone_white);
-    // Light shadow
-    draw_rect(x +10, y +7,  2, 1, bone_shadow);
-
-    // Second bone: top-left to bottom-right
-    draw_rect(x,     y + 4, 2, 2, bone_white);
-    draw_rect(x + 2, y + 3, 2, 4, bone_white);
-    draw_rect(x + 4, y + 2, 2, 6, bone_white);
-    draw_rect(x + 6, y + 1, 2, 8, bone_white);
-    draw_rect(x + 8, y,     2, 10, bone_white);
-    // Ends
-    draw_rect(x -1,  y + 3, 2, 4, bone_white);
-    draw_rect(x + 9, y -1,  3, 3, bone_white);
-    draw_rect(x + 9, y +8,  3, 3, bone_white);
+    // Vertical bar (2px wide, 12px tall)
+    draw_rect(x + 5, y - 6, 2, 12, col);
+    // Horizontal bar (12px wide, 2px tall)
+    draw_rect(x - 6, y - 0, 12, 2, col);
+    // Subtle shadow at lower-right
+    draw_rect(x + 7, y + 2, 1, 6, shadow);
+    draw_rect(x - 1, y + 2, 8, 1, shadow);
 }
 
 void update_game() {
@@ -611,6 +679,26 @@ void draw_chicken(Chicken* c) {
     
     // Determine if chicken is facing left (flip sprite)
     u8 facing_left = (c->dx < 0);
+
+    // Sitting pose (for pre-egg-lay state): squat body, head lower, no legs
+    if (c->is_sitting) {
+        // Draw a simple rounded sitting shape regardless of age, with a beak and eye
+        if (facing_left) {
+            draw_rect(c->x + 2, c->y + 2, 12, 6, body_color); // wider, lower body
+            draw_rect(c->x,     c->y,     6, 5, body_color);  // head on left
+            draw_rect(c->x - 2, c->y + 1, 2, 2, COLOR_ORANGE); // beak left
+            draw_pixel(c->x + 2, c->y + 1, COLOR_BLACK);      // eye
+        } else {
+            draw_rect(c->x,     c->y + 2, 12, 6, body_color); // wider, lower body
+            draw_rect(c->x + 8, c->y,     6, 5, body_color);  // head on right
+            draw_rect(c->x + 14, c->y + 1, 2, 2, COLOR_ORANGE); // beak right
+            draw_pixel(c->x + 12, c->y + 1, COLOR_BLACK);     // eye
+        }
+        // Optional subtle shadow under the body
+        draw_rect(c->x + 2, c->y + 8, 10, 1, RGB(10, 10, 10));
+
+        // Draw hunger bar and heart as usual below
+    } else
     
     // Determine age stage: baby (0-30s), adult (30-60s), old (60-90s)
     // Baby: 0-1800 frames, Adult: 1800-3600, Old: 3600-5400
@@ -746,17 +834,42 @@ void draw_chicken(Chicken* c) {
     
     // Draw heart when happy (ate favorite food)
     if (c->happiness_timer > 0) {
-        s16 heart_y = c->y - 8;
-        if (heart_y >= 16) {  // Only draw if heart won't overlap UI (15px UI bar)
-            // Simple heart shape above chicken
-            s16 heart_x = c->x + 14;
-            
-            // Heart (pink/red)
-            draw_rect(heart_x, heart_y + 1, 1, 2, RGB(31, 10, 15));     // Left top
-            draw_rect(heart_x + 2, heart_y + 1, 1, 2, RGB(31, 10, 15)); // Right top
-            draw_rect(heart_x + 1, heart_y, 1, 4, RGB(31, 10, 15));     // Middle
-            draw_pixel(heart_x + 1, heart_y + 3, RGB(31, 5, 10));       // Bottom point
+        // Pulsing heart: grow/shrink a darker halo behind a bright heart
+        int cyc = (frames / 6) % 6;          // pulse speed (~10 pulses/sec)
+    int ex = (cyc < 3) ? cyc : (5 - cyc); // 0,1,2,1,0,0
+    if (ex < 0) ex = 0;
+    if (ex > 2) ex = 2;
+
+        s16 heart_y_base = c->y - 10;
+        s16 heart_x_base = c->x + 12;
+        // Lift a bit when expanded so it doesn't overlap UI and stays centered visually
+        s16 heart_y = heart_y_base - ex;
+        s16 heart_x = heart_x_base - ex;
+        if (heart_y < 16) heart_y = 16; // avoid UI band
+
+        u16 hc = RGB(31, 12, 18);       // bright pink/red
+        u16 hc_dark = RGB(31, 6, 12);   // darker accent
+        u16 halo = RGB(24, 4, 8);       // dark halo color
+
+        // Halo layer (only when expanded)
+        if (ex > 0) {
+            // Top lobes (wider/taller with ex)
+            draw_rect(heart_x + 1, heart_y + 0, 2 + ex, 2 + (ex > 1 ? 1 : 0), halo);
+            draw_rect(heart_x + 4 + ex, heart_y + 0, 2 + ex, 2 + (ex > 1 ? 1 : 0), halo);
+            // Middle bands (wider with ex)
+            draw_rect(heart_x + 0, heart_y + 2, 7 + 2 * ex, 2, halo);
+            draw_rect(heart_x + 1, heart_y + 4, 5 + 2 * ex, 2, halo);
+            // Bottom point (slightly longer when expanded)
+            draw_rect(heart_x + 3 + ex, heart_y + 6, 1, 2 + (ex > 0 ? 1 : 0), halo);
         }
+
+        // Foreground bright heart (base size)
+        draw_rect(heart_x + 1, heart_y + 0, 2, 2, hc);   // left lobe
+        draw_rect(heart_x + 4, heart_y + 0, 2, 2, hc);   // right lobe
+        draw_rect(heart_x + 0, heart_y + 2, 7, 2, hc);   // middle
+        draw_rect(heart_x + 1, heart_y + 4, 5, 2, hc);   // middle 2
+        draw_rect(heart_x + 3, heart_y + 6, 1, 2, hc_dark); // bottom point
+        draw_pixel(heart_x + 1, heart_y + 1, COLOR_WHITE);  // highlight
     }
 }
 

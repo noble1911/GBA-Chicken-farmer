@@ -48,6 +48,12 @@ typedef struct {
     // Accumulators for time-scaled periodic effects
     u16 hunger_tick_accum;     // accumulates toward hunger decrement period
     u16 satiation_tick_accum;  // accumulates toward satiation decrement period
+    // Egg-laying pre-sit state
+    u8 is_sitting;      // 1 when preparing to lay egg (shows sitting sprite)
+    u16 sit_timer;      // counts down (~5s) before egg appears
+    // Natural movement timing
+    u16 idle_timer;     // when >0, chicken rests (dx=dy=0)
+    u16 move_timer;     // duration to keep current direction before reevaluating
 } Chicken;
 
 // Food structure
