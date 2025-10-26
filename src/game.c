@@ -58,6 +58,36 @@ u8 rand_range(u8 min, u8 max) {
     return min + (simple_rand() % (max - min + 1));
 }
 
+// Approximate hue shift by cyclically mixing RGB channels.
+// step is 0..256 (fractional mix). Positive shifts R->G->B, negative shifts R<-G<-B.
+static u16 hue_shift_cycle(u16 color, int step) {
+    if (step == 0) return color;
+    int r = (color & 0x1F);
+    int g = (color >> 5) & 0x1F;
+    int b = (color >> 10) & 0x1F;
+    if (step > 0) {
+        int s = (step > 256) ? 256 : step;
+        int inv = 256 - s;
+        int nr = (r * inv + g * s) >> 8;
+        int ng = (g * inv + b * s) >> 8;
+        int nb = (b * inv + r * s) >> 8;
+        if (nr < 0) nr = 0; else if (nr > 31) nr = 31;
+        if (ng < 0) ng = 0; else if (ng > 31) ng = 31;
+        if (nb < 0) nb = 0; else if (nb > 31) nb = 31;
+        return RGB(nr, ng, nb);
+    } else {
+        int s = -step; if (s > 256) s = 256;
+        int inv = 256 - s;
+        int nr = (r * inv + b * s) >> 8;
+        int ng = (g * inv + r * s) >> 8;
+        int nb = (b * inv + g * s) >> 8;
+        if (nr < 0) nr = 0; else if (nr > 31) nr = 31;
+        if (ng < 0) ng = 0; else if (ng > 31) ng = 31;
+        if (nb < 0) nb = 0; else if (nb > 31) nb = 31;
+        return RGB(nr, ng, nb);
+    }
+}
+
 // Genetics functions
 u8 mutate_gene(u8 value) {
     // 30% chance to mutate
@@ -90,6 +120,12 @@ ChickenGenes create_genes(ChickenGenes* parent) {
             case 2: genes.color = RGB(25, 15, 5); break;  // Brown
             case 3: genes.color = RGB(31, 31, 10); break; // Yellow
             case 4: genes.color = RGB(20, 10, 5); break;  // Dark brown
+        }
+        // Occasionally hue-shift base colors for variety
+        if ((simple_rand() % 100) < 25) {
+            int dir = (simple_rand() & 1) ? 1 : -1;
+            int amt = 64 + (simple_rand() % 65); // ~25% to ~50%
+            genes.color = hue_shift_cycle(genes.color, dir * amt);
         }
     } else {
         // Inherit with mutation
@@ -131,6 +167,12 @@ ChickenGenes create_genes(ChickenGenes* parent) {
         }
         
         genes.color = RGB(r, g, b);
+        // Occasional hue shift around the parent's hue for diversity
+        if ((simple_rand() % 100) < 15) {
+            int dir = (simple_rand() & 1) ? 1 : -1;
+            int amt = 48 + (simple_rand() % 81); // ~19% to ~50%
+            genes.color = hue_shift_cycle(genes.color, dir * amt);
+        }
     }
     
     // Very rare special mutation: pink chicken
